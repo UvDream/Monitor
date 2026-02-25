@@ -29,6 +29,10 @@ class ScreenGuardController: NSObject, ObservableObject {
     @Published var isCalibrated = false
     @Published var statusMessage = "就绪"
 
+    /// Whether a valid calibration has been saved from a previous session.
+    /// When `true`, the next `startMonitoring()` will skip the calibration phase entirely.
+    @Published var hasStoredCalibration: Bool = false
+
     /// Seconds a threat must persist before triggering — persisted across launches.
     @Published var detectionDelay: Double {
         didSet { UserDefaults.standard.set(detectionDelay, forKey: detectionDelayKey) }
@@ -112,12 +116,13 @@ class ScreenGuardController: NSObject, ObservableObject {
 
     // MARK: - Persistence Keys
 
-    private let whitelistKey        = "monitor.whitelistedApps"
-    private let targetAppKey        = "monitor.targetApp"
-    private let detectionDelayKey   = "monitor.detectionDelay"
-    private let cooldownDurationKey = "monitor.cooldownDuration"
-    private let snapshotEnabledKey  = "monitor.snapshotEnabled"
+    private let whitelistKey         = "monitor.whitelistedApps"
+    private let targetAppKey         = "monitor.targetApp"
+    private let detectionDelayKey    = "monitor.detectionDelay"
+    private let cooldownDurationKey  = "monitor.cooldownDuration"
+    private let snapshotEnabledKey   = "monitor.snapshotEnabled"
     private let snapshotDirectoryKey = "monitor.snapshotDirectory"
+    private let ownerFaceAreaKey     = "monitor.ownerFaceArea"
 
     // MARK: - Init
 
@@ -135,11 +140,15 @@ class ScreenGuardController: NSObject, ObservableObject {
         if let savedPath = UserDefaults.standard.string(forKey: "monitor.snapshotDirectory"),
            !savedPath.isEmpty {
             let url = URL(fileURLWithPath: savedPath)
-            // Only restore if the directory still exists
             snapshotDirectory = FileManager.default.fileExists(atPath: url.path) ? url : nil
         } else {
             snapshotDirectory = nil
         }
+
+        // Restore saved calibration — if ownerFaceArea > 0 we can skip calibration on next start.
+        let savedArea = UserDefaults.standard.double(forKey: "monitor.ownerFaceArea")
+        ownerFaceArea        = CGFloat(savedArea)
+        hasStoredCalibration = savedArea > 0
 
         super.init()
         loadWhitelist()
@@ -205,15 +214,17 @@ class ScreenGuardController: NSObject, ObservableObject {
     // MARK: - Start / Stop
 
     func startMonitoring() {
-        // Reset all state
-        isCalibrated = false
+        // Reset detection state — but preserve ownerFaceArea if already calibrated from a prior session
         calibrationSamples.removeAll()
-        ownerFaceArea = 0
         threatStartTime = nil
         cooldownUntil = nil
         threatDetected = false
         sessionSnapshotCount = 0
-        cancelCooldownTimer()   // ← cancel any leftover cooldown from a previous session
+        cancelCooldownTimer()
+
+        // Skip calibration if we already have a stored face-area reference
+        let skipCalibration = ownerFaceArea > 0
+        isCalibrated = skipCalibration
 
         processingQueue.async { [weak self] in
             self?.captureSession.startRunning()
@@ -221,8 +232,22 @@ class ScreenGuardController: NSObject, ObservableObject {
 
         DispatchQueue.main.async {
             self.isMonitoring = true
-            self.statusMessage = "校准中 - 请正对摄像头，确保只有你…"
+            self.statusMessage = skipCalibration
+                ? "✅ 监控中（使用已保存的校准数据）"
+                : "校准中 - 请正对摄像头，确保只有你…"
         }
+    }
+
+    /// Clears the stored calibration so the next `startMonitoring()` will recalibrate from scratch.
+    /// If monitoring is currently active it is stopped first.
+    func resetCalibration() {
+        if isMonitoring { stopMonitoring() }
+        ownerFaceArea = 0
+        calibrationSamples.removeAll()
+        hasStoredCalibration = false
+        isCalibrated = false
+        UserDefaults.standard.removeObject(forKey: ownerFaceAreaKey)
+        statusMessage = "校准已重置 — 下次启动将重新校准（约 6 秒）"
     }
 
     func stopMonitoring() {
@@ -300,7 +325,10 @@ class ScreenGuardController: NSObject, ObservableObject {
         if calibrationSamples.count >= calibrationSampleCount {
             ownerFaceArea = calibrationSamples.reduce(0, +) / CGFloat(calibrationSamples.count)
             isCalibrated = true
-            statusMessage = "✅ 监控中"
+            hasStoredCalibration = true
+            // Persist so future launches skip calibration
+            UserDefaults.standard.set(Double(ownerFaceArea), forKey: ownerFaceAreaKey)
+            statusMessage = "✅ 校准完成，监控中（数据已保存）"
         }
     }
 

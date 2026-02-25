@@ -76,7 +76,9 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(controller.isMonitoring ? .red : .accentColor)
 
-                    // Target App
+                    // Calibration Status
+                    CalibrationStatusView()
+
                     GroupBox {
                         HStack {
                             Image(nsImage: controller.targetApp.icon)
@@ -223,6 +225,64 @@ struct ContentView: View {
         if controller.threatDetected { return .red }
         if !controller.isCalibrated { return .yellow }
         return .green
+    }
+}
+
+// MARK: - Calibration Status View
+
+private struct CalibrationStatusView: View {
+    @EnvironmentObject var controller: ScreenGuardController
+    @State private var showResetConfirm = false
+
+    var body: some View {
+        GroupBox {
+            HStack(spacing: 12) {
+                // Icon
+                Image(systemName: controller.hasStoredCalibration
+                      ? "person.crop.circle.badge.checkmark"
+                      : "person.crop.circle.badge.questionmark")
+                    .font(.title2)
+                    .foregroundColor(controller.hasStoredCalibration ? .green : .orange)
+
+                // Status text
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(controller.hasStoredCalibration ? "校准数据已保存" : "尚未校准")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+
+                    Text(controller.hasStoredCalibration
+                         ? "启动监控时将直接跳过校准阶段"
+                         : "首次启动监控时将自动校准（约 6 秒）")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                // Reset button (only shown when calibration data exists)
+                if controller.hasStoredCalibration {
+                    Button("重新校准") {
+                        showResetConfirm = true
+                    }
+                    .controlSize(.small)
+                    .foregroundColor(.orange)
+                    .confirmationDialog(
+                        "确认重置校准？",
+                        isPresented: $showResetConfirm,
+                        titleVisibility: .visible
+                    ) {
+                        Button("重置", role: .destructive) {
+                            controller.resetCalibration()
+                        }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text("已保存的人脸校准数据将被清除，下次启动监控时需要重新校准（约 6 秒）。")
+                    }
+                }
+            }
+        } label: {
+            Label("人脸校准", systemImage: "person.crop.rectangle.stack.fill")
+        }
     }
 }
 

@@ -1,0 +1,21 @@
+# Build output
+build/
+*.app
+*.dmg
+*.zip
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# Temporary
+*.o
+*.d
+GenerateIcon

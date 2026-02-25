@@ -1,0 +1,136 @@
+name: Build & Release
+
+on:
+  # 推送 tag 时触发自动发版
+  push:
+    tags:
+      - 'v*'     # e.g. v1.0.0, v1.2.3
+  # 也支持手动触发
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (如 1.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # 需要写权限来创建 Release
+
+jobs:
+  build:
+    name: 构建 macOS 应用
+    runs-on: macos-14   # Apple Silicon (M1) runner，支持 Universal Binary
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 获取版本号
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "📦 版本号: ${VERSION}"
+
+      - name: 更新 Info.plist 版本号
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" Resources/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" Resources/Info.plist
+
+      - name: 构建 Universal Binary
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: 验证构建产物
+        run: |
+          echo "=== 二进制架构 ==="
+          lipo -archs build/Monitor.app/Contents/MacOS/Monitor
+          echo ""
+          echo "=== 签名信息 ==="
+          codesign -dvv build/Monitor.app 2>&1 || true
+          echo ""
+          echo "=== 应用大小 ==="
+          du -sh build/Monitor.app
+
+      - name: 打包 DMG
+        run: |
+          APP_NAME="Monitor"
+          DMG_NAME="Monitor-${{ steps.version.outputs.version }}-universal.dmg"
+          DMG_DIR="build/dmg"
+          
+          mkdir -p "${DMG_DIR}"
+          cp -R "build/${APP_NAME}.app" "${DMG_DIR}/"
+          
+          # 创建 Applications 快捷方式
+          ln -s /Applications "${DMG_DIR}/Applications"
+          
+          # 创建 DMG
+          hdiutil create \
+            -volname "${APP_NAME}" \
+            -srcfolder "${DMG_DIR}" \
+            -ov \
+            -format UDZO \
+            "build/${DMG_NAME}"
+          
+          echo "dmg_name=${DMG_NAME}" >> "$GITHUB_ENV"
+          echo "✅ DMG 创建成功: build/${DMG_NAME}"
+          ls -lh "build/${DMG_NAME}"
+
+      - name: 打包 ZIP
+        run: |
+          cd build
+          ZIP_NAME="Monitor-${{ steps.version.outputs.version }}-universal.zip"
+          ditto -c -k --keepParent Monitor.app "${ZIP_NAME}"
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_ENV"
+          echo "✅ ZIP 创建成功: ${ZIP_NAME}"
+          ls -lh "${ZIP_NAME}"
+
+      - name: 上传构建产物 (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Monitor-${{ steps.version.outputs.version }}
+          path: |
+            build/${{ env.dmg_name }}
+            build/${{ env.zip_name }}
+          retention-days: 30
+
+      - name: 创建 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "屏幕卫士 v${{ steps.version.outputs.version }}"
+          body: |
+            ## 屏幕卫士 v${{ steps.version.outputs.version }}
+            
+            ### 📥 下载
+            - **DMG 安装包** — 推荐，拖拽安装
+            - **ZIP 压缩包** — 解压即用
+            
+            ### 系统要求
+            - macOS 13.0 (Ventura) 或更高版本
+            - 支持 Apple Silicon (M1/M2/M3) 和 Intel Mac (Universal Binary)
+            - 需要摄像头权限
+            
+            ### 使用方式
+            1. 下载 DMG 或 ZIP
+            2. 将 Monitor.app 拖入 Applications 文件夹（或直接运行）
+            3. 首次运行时授权摄像头权限
+            4. 点击「开始监控」
+            
+            ---
+            构建编号: #${{ github.run_number }} | 提交: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          files: |
+            build/${{ env.dmg_name }}
+            build/${{ env.zip_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -119,16 +119,8 @@ class StatusBarController: NSObject, ObservableObject {
     }
 
     @objc private func showMainWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        if let window = NSApp.windows.first(where: { $0.isVisible || $0.canBecomeMain }) {
-            window.makeKeyAndOrderFront(nil)
-        }
-        // Also try to unhide (in case user closed the window)
-        for window in NSApp.windows {
-            if window.title.contains("Monitor") || window.className.contains("SwiftUI") {
-                window.makeKeyAndOrderFront(nil)
-                break
-            }
+        if let appDelegate = NSApp.delegate as? AppDelegate {
+            appDelegate.showMainWindow()
         }
     }
 

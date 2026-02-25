@@ -1,16 +1,18 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject var controller: ScreenGuardController
     @State private var showWhitelistSheet = false
     @State private var showTargetPicker = false
+    @State private var showDirectoryPicker = false
 
     var body: some View {
         VStack(spacing: 0) {
             // Camera Preview
             ZStack {
-                CameraPreviewView(session: controller.captureSession)
+                CameraPreviewView(session: controller.session)
                     .frame(minHeight: 260)
 
                 // Threat border overlay
@@ -176,17 +178,17 @@ struct ContentView: View {
                                 .foregroundColor(.secondary)
                         }
                     } label: {
-                        Label("设置", systemImage: "gear")
+                        Label("检测设置", systemImage: "gear")
                     }
+
+                    // ── Snapshot Feature ──────────────────────────────────────
+                    SnapshotSettingsView(showDirectoryPicker: $showDirectoryPicker)
                 }
                 .padding()
             }
             .background(.background)
         }
         .frame(minWidth: 440, minHeight: 620)
-        .onAppear {
-            controller.requestCameraAccess()
-        }
         .sheet(isPresented: $showWhitelistSheet) {
             AppPickerView(title: "添加白名单应用", subtitle: "选择不需要保护的应用") { app in
                 controller.addToWhitelist(app)
@@ -197,6 +199,23 @@ struct ContentView: View {
                 controller.targetApp = app
             }
         }
+        // Directory picker — uses the system folder-selection panel
+        .fileImporter(
+            isPresented: $showDirectoryPicker,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                // On macOS, fileImporter may return a security-scoped URL.
+                // Start accessing it so we can verify the path is reachable.
+                _ = url.startAccessingSecurityScopedResource()
+                controller.snapshotDirectory = url
+            case .failure:
+                break
+            }
+        }
     }
 
     private var statusColor: Color {
@@ -204,6 +223,106 @@ struct ContentView: View {
         if controller.threatDetected { return .red }
         if !controller.isCalibrated { return .yellow }
         return .green
+    }
+}
+
+// MARK: - Snapshot Settings Panel
+
+private struct SnapshotSettingsView: View {
+    @EnvironmentObject var controller: ScreenGuardController
+    @Binding var showDirectoryPicker: Bool
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                // Toggle row
+                Toggle(isOn: $controller.snapshotEnabled) {
+                    Text("触发时自动截图偷窥者")
+                        .font(.subheadline)
+                }
+                .toggleStyle(.switch)
+
+                if controller.snapshotEnabled {
+                    Divider()
+
+                    // Directory picker row
+                    HStack(spacing: 8) {
+                        Image(systemName: controller.snapshotDirectory != nil
+                              ? "folder.fill"
+                              : "folder.badge.questionmark")
+                            .foregroundColor(controller.snapshotDirectory != nil ? .accentColor : .secondary)
+                            .frame(width: 16)
+
+                        if let dir = controller.snapshotDirectory {
+                            Text(dir.path)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .foregroundColor(.primary)
+                        } else {
+                            Text("未选择保存目录")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .italic()
+                        }
+
+                        Spacer()
+
+                        Button(controller.snapshotDirectory != nil ? "更改" : "选择") {
+                            showDirectoryPicker = true
+                        }
+                        .controlSize(.small)
+
+                        if controller.snapshotDirectory != nil {
+                            Button {
+                                openSnapshotDirectory()
+                            } label: {
+                                Image(systemName: "arrow.up.right.square")
+                            }
+                            .controlSize(.small)
+                            .buttonStyle(.borderless)
+                            .help("在 Finder 中打开")
+                        }
+                    }
+
+                    // Session counter (only shown after at least one snapshot)
+                    if controller.sessionSnapshotCount > 0 {
+                        HStack(spacing: 6) {
+                            Image(systemName: "photo.stack.fill")
+                                .foregroundColor(.green)
+                                .font(.caption)
+                            Text("本次已保存 \(controller.sessionSnapshotCount) 张截图")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.top, 2)
+                    }
+
+                    // Warning if enabled but no directory chosen
+                    if controller.snapshotDirectory == nil {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                                .font(.caption2)
+                            Text("请先选择保存目录，否则截图功能不会生效")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
+                    }
+
+                    Text("检测到偷窥者时，将从摄像头截取一张照片保存到指定目录")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+        } label: {
+            Label("截图保护", systemImage: "camera.on.rectangle.fill")
+        }
+    }
+
+    private func openSnapshotDirectory() {
+        guard let dir = controller.snapshotDirectory else { return }
+        NSWorkspace.shared.open(dir)
     }
 }
 
@@ -218,6 +337,7 @@ struct AppPickerView: View {
     @State private var searchText = ""
     @State private var apps: [AppInfo] = []
     @State private var showRunningOnly = false
+    @State private var isLoading = false
 
     var filteredApps: [AppInfo] {
         if searchText.isEmpty { return apps }
@@ -267,40 +387,60 @@ struct AppPickerView: View {
 
             Divider()
 
-            // App list
-            List(filteredApps) { app in
-                Button(action: {
-                    onSelect(app)
-                    dismiss()
-                }) {
-                    HStack(spacing: 10) {
-                        Image(nsImage: app.icon)
-                            .resizable()
-                            .frame(width: 28, height: 28)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(app.name)
-                                .font(.subheadline)
-                            Text(app.bundleId)
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                        }
-                        Spacer()
+            // App list — shows a spinner while scanning the filesystem
+            ZStack {
+                if isLoading {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .scaleEffect(0.8)
+                        Text("正在读取应用列表…")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
-                    .contentShape(Rectangle())
-                    .padding(.vertical, 2)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(filteredApps) { app in
+                        Button(action: {
+                            onSelect(app)
+                            dismiss()
+                        }) {
+                            HStack(spacing: 10) {
+                                Image(nsImage: app.icon)
+                                    .resizable()
+                                    .frame(width: 28, height: 28)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(app.name)
+                                        .font(.subheadline)
+                                    Text(app.bundleId)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                            .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .listStyle(.inset)
                 }
-                .buttonStyle(.plain)
             }
-            .listStyle(.inset)
 
             Divider()
 
             // Footer
             HStack {
-                Text("\(filteredApps.count) 个应用")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                if isLoading {
+                    Text("加载中…")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("\(filteredApps.count) 个应用")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
                 Spacer()
                 Button("取消") { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -312,6 +452,15 @@ struct AppPickerView: View {
     }
 
     private func refreshApps() {
-        apps = showRunningOnly ? AppInfo.runningApps() : AppInfo.installedApps()
+        isLoading = true
+        apps = []
+        let runningOnly = showRunningOnly
+        Task.detached(priority: .userInitiated) {
+            let result = runningOnly ? AppInfo.runningApps() : AppInfo.installedApps()
+            await MainActor.run {
+                apps = result
+                isLoading = false
+            }
+        }
     }
 }

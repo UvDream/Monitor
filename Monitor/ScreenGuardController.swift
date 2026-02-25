@@ -8,13 +8,17 @@ import Combine
 /// Core controller: manages camera capture, face detection, and automatic app switching.
 ///
 /// Detection logic:
-///   1. **Calibration** – On start, records the user's face size over 30 frames (≈1.5 s at 200 ms intervals).
+///   1. **Calibration** – On start, records the user's face size over 30 frames (≈6 s at 200 ms intervals).
 ///   2. **Monitoring** – After calibration, continuously detects faces in camera frames.
-///      - The *owner* is identified as the largest face (closest to camera).
-///      - Any additional face whose yaw is roughly facing the camera (|yaw| < 0.5 rad) is considered
-///        a potential threat (someone looking at the screen).
-///      - If a threat persists for `detectionDelay` seconds, VS Code is activated.
+///      - The *owner* is identified as the face whose area is **closest** to the calibrated reference area
+///        (not simply the largest face, which could be a snooper who leans in).
+///      - Any other face whose yaw roughly faces the camera (|yaw| < 0.5 rad) is a potential threat.
+///      - If a threat persists for `detectionDelay` seconds, the target app is activated.
 ///   3. **Cooldown** – After switching, detection pauses for `cooldownDuration` seconds.
+///      The cooldown timer uses a cancellable `DispatchWorkItem` so stopping monitoring
+///      always cancels any pending callback (fixes the previous race condition).
+///   4. **Snapshot** – When a threat triggers, the latest camera frame is saved as a JPEG
+///      to a user-specified directory (if the feature is enabled).
 class ScreenGuardController: NSObject, ObservableObject {
 
     // MARK: - Published State
@@ -24,12 +28,20 @@ class ScreenGuardController: NSObject, ObservableObject {
     @Published var threatDetected = false
     @Published var isCalibrated = false
     @Published var statusMessage = "就绪"
-    @Published var detectionDelay: Double = 1.0      // seconds a threat must persist before triggering
-    @Published var cooldownDuration: Double = 10.0    // seconds to pause after switching
+
+    /// Seconds a threat must persist before triggering — persisted across launches.
+    @Published var detectionDelay: Double {
+        didSet { UserDefaults.standard.set(detectionDelay, forKey: detectionDelayKey) }
+    }
+
+    /// Seconds to pause detection after switching — persisted across launches.
+    @Published var cooldownDuration: Double {
+        didSet { UserDefaults.standard.set(cooldownDuration, forKey: cooldownDurationKey) }
+    }
 
     // MARK: - Whitelist & Target App
 
-    /// Apps in the whitelist are "safe" — no auto-switching when one of them is the active foreground app.
+    /// Apps in the whitelist are "safe" — no auto-switching when one is in the foreground.
     @Published var whitelistedApps: [AppInfo] = [] {
         didSet { saveWhitelist() }
     }
@@ -39,11 +51,29 @@ class ScreenGuardController: NSObject, ObservableObject {
         didSet { saveTargetApp() }
     }
 
-    // MARK: - Camera
+    // MARK: - Snapshot Feature
 
-    let captureSession = AVCaptureSession()
+    /// Whether to save a camera snapshot when an intruder is detected.
+    @Published var snapshotEnabled: Bool {
+        didSet { UserDefaults.standard.set(snapshotEnabled, forKey: snapshotEnabledKey) }
+    }
+
+    /// Directory where intruder snapshots are saved.
+    @Published var snapshotDirectory: URL? {
+        didSet { UserDefaults.standard.set(snapshotDirectory?.path, forKey: snapshotDirectoryKey) }
+    }
+
+    /// Number of snapshots saved in the current monitoring session.
+    @Published var sessionSnapshotCount: Int = 0
+
+    // MARK: - Camera (private session with read-only accessor)
+
+    private let captureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
     private let processingQueue = DispatchQueue(label: "com.monitor.facedetection", qos: .userInitiated)
+
+    /// Read-only accessor for the preview layer (CameraPreviewView).
+    var session: AVCaptureSession { captureSession }
 
     // MARK: - Detection internals
 
@@ -51,25 +81,66 @@ class ScreenGuardController: NSObject, ObservableObject {
     private var lastProcessTime = Date.distantPast
     private let processInterval: TimeInterval = 0.2
 
-    /// Timestamp when a threat was first detected continuously.
-    private var threatStartTime: Date?
-
-    /// Cooldown end timestamp.
-    private var cooldownUntil: Date?
-
-    // MARK: - Calibration
-
+    /// Calibrated reference face area (main thread).
     private var ownerFaceArea: CGFloat = 0
     private var calibrationSamples: [CGFloat] = []
     private let calibrationSampleCount = 30
 
+    /// Timestamp when a threat was first detected continuously (main thread).
+    private var threatStartTime: Date?
+
+    /// Cooldown end timestamp (main thread).
+    private var cooldownUntil: Date?
+
+    /// Cancellable cooldown timer — prevents the old `asyncAfter` from firing after stopMonitoring().
+    private var cooldownWorkItem: DispatchWorkItem?
+
+    // MARK: - Snapshot internals
+
+    /// Protects cross-thread access to `_latestPixelBuffer`.
+    private let bufferLock = NSLock()
+
+    /// Latest camera frame received from the capture session.
+    /// Written on `processingQueue`, read on `snapshotQueue`.
+    private var _latestPixelBuffer: CVPixelBuffer?
+
+    /// Background queue for image rendering and file I/O (avoids stalling the camera feed).
+    private let snapshotQueue = DispatchQueue(label: "com.monitor.snapshot", qos: .utility)
+
+    /// Reusable CIContext — creating one per frame is expensive.
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+
     // MARK: - Persistence Keys
-    private let whitelistKey = "monitor.whitelistedApps"
-    private let targetAppKey = "monitor.targetApp"
+
+    private let whitelistKey        = "monitor.whitelistedApps"
+    private let targetAppKey        = "monitor.targetApp"
+    private let detectionDelayKey   = "monitor.detectionDelay"
+    private let cooldownDurationKey = "monitor.cooldownDuration"
+    private let snapshotEnabledKey  = "monitor.snapshotEnabled"
+    private let snapshotDirectoryKey = "monitor.snapshotDirectory"
 
     // MARK: - Init
 
     override init() {
+        // Restore persisted settings (fall back to sensible defaults if never saved).
+        // Note: these assignments run before super.init(), so `didSet` observers are NOT triggered.
+        let savedDelay    = UserDefaults.standard.double(forKey: "monitor.detectionDelay")
+        detectionDelay    = savedDelay > 0 ? savedDelay : 1.0
+
+        let savedCooldown = UserDefaults.standard.double(forKey: "monitor.cooldownDuration")
+        cooldownDuration  = savedCooldown > 0 ? savedCooldown : 10.0
+
+        snapshotEnabled   = UserDefaults.standard.bool(forKey: "monitor.snapshotEnabled")
+
+        if let savedPath = UserDefaults.standard.string(forKey: "monitor.snapshotDirectory"),
+           !savedPath.isEmpty {
+            let url = URL(fileURLWithPath: savedPath)
+            // Only restore if the directory still exists
+            snapshotDirectory = FileManager.default.fileExists(atPath: url.path) ? url : nil
+        } else {
+            snapshotDirectory = nil
+        }
+
         super.init()
         loadWhitelist()
         loadTargetApp()
@@ -101,7 +172,6 @@ class ScreenGuardController: NSObject, ObservableObject {
     // MARK: - Camera Setup
 
     private func setupCamera() {
-        // Prefer the default video device (built-in FaceTime camera on most Macs)
         guard let device = AVCaptureDevice.default(for: .video) else {
             DispatchQueue.main.async { self.statusMessage = "❌ 未找到摄像头" }
             return
@@ -135,13 +205,15 @@ class ScreenGuardController: NSObject, ObservableObject {
     // MARK: - Start / Stop
 
     func startMonitoring() {
-        // Reset calibration state
+        // Reset all state
         isCalibrated = false
         calibrationSamples.removeAll()
         ownerFaceArea = 0
         threatStartTime = nil
         cooldownUntil = nil
         threatDetected = false
+        sessionSnapshotCount = 0
+        cancelCooldownTimer()   // ← cancel any leftover cooldown from a previous session
 
         processingQueue.async { [weak self] in
             self?.captureSession.startRunning()
@@ -154,6 +226,8 @@ class ScreenGuardController: NSObject, ObservableObject {
     }
 
     func stopMonitoring() {
+        cancelCooldownTimer()   // ← guarantees the asyncAfter block never fires after this
+
         processingQueue.async { [weak self] in
             self?.captureSession.stopRunning()
         }
@@ -166,19 +240,36 @@ class ScreenGuardController: NSObject, ObservableObject {
         }
     }
 
+    /// Cancels any pending cooldown DispatchWorkItem.
+    private func cancelCooldownTimer() {
+        cooldownWorkItem?.cancel()
+        cooldownWorkItem = nil
+    }
+
     // MARK: - Face Processing
 
+    /// Called on `processingQueue` from the sample buffer delegate.
+    /// Performs lightweight pre-computation here, then dispatches only state
+    /// mutations and UI updates to the main thread (keeps main thread free).
     private func processFaces(_ faces: [VNFaceObservation]) {
+        // --- Pre-computation on processingQueue (pure, no shared state) ---
+        let count = faces.count
+
+        // Extract areas and yaws into plain value arrays — cheap, avoids bridging costs on main thread
+        let areas: [CGFloat] = faces.map { $0.boundingBox.width * $0.boundingBox.height }
+        let yaws:  [Double]  = faces.map { $0.yaw?.doubleValue ?? 0 }
+
+        // --- State mutations and UI updates on main thread ---
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.faceCount = faces.count
+            self.faceCount = count
 
             if !self.isCalibrated {
-                self.calibrate(with: faces)
+                self.calibrate(areas: areas)
                 return
             }
 
-            // During cooldown, skip detection
+            // During cooldown, just show countdown and skip detection
             if let cd = self.cooldownUntil {
                 if Date() < cd {
                     let remaining = Int(cd.timeIntervalSinceNow) + 1
@@ -189,24 +280,20 @@ class ScreenGuardController: NSObject, ObservableObject {
                 }
             }
 
-            self.detectThreat(in: faces)
+            self.detectThreat(areas: areas, yaws: yaws)
         }
     }
 
-    // MARK: - Calibration
+    // MARK: - Calibration (main thread)
 
-    private func calibrate(with faces: [VNFaceObservation]) {
-        // Require exactly one face during calibration
-        guard faces.count == 1 else {
+    private func calibrate(areas: [CGFloat]) {
+        guard areas.count == 1 else {
             calibrationSamples.removeAll()
             statusMessage = "校准中 - 请确保只有你在画面中…"
             return
         }
 
-        let face = faces[0]
-        let area = face.boundingBox.width * face.boundingBox.height
-        calibrationSamples.append(area)
-
+        calibrationSamples.append(areas[0])
         let remaining = calibrationSampleCount - calibrationSamples.count
         statusMessage = "校准中… 还需 \(remaining) 帧"
 
@@ -217,34 +304,30 @@ class ScreenGuardController: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Threat Detection
+    // MARK: - Threat Detection (main thread)
 
-    private func detectThreat(in faces: [VNFaceObservation]) {
-        guard faces.count > 1 else {
-            // 0 or 1 face → safe
+    private func detectThreat(areas: [CGFloat], yaws: [Double]) {
+        guard areas.count > 1 else {
             clearThreat()
-            if isCalibrated && !threatDetected {
-                statusMessage = "✅ 监控中"
-            }
+            if isCalibrated && !threatDetected { statusMessage = "✅ 监控中" }
             return
         }
 
-        // Sort faces by area descending; the largest ≈ the owner (closest)
-        let sorted = faces.sorted { ($0.boundingBox.width * $0.boundingBox.height) > ($1.boundingBox.width * $1.boundingBox.height) }
+        // Identify the owner as the face whose area is *closest* to the calibrated reference.
+        // The original code naively picked the largest face, which fails when a snooper leans in
+        // close enough to become the biggest face in frame.
+        let ownerIndex = areas.enumerated().min(by: {
+            abs($0.element - ownerFaceArea) < abs($1.element - ownerFaceArea)
+        })?.offset ?? 0
 
-        // Every face except the largest is a potential "other person"
-        let others = Array(sorted.dropFirst())
+        // All other faces are potential snoopers
+        let snoopers = areas.indices.filter { $0 != ownerIndex }
 
-        // Check if any of the other faces are roughly facing the camera
-        let lookingAtScreen = others.filter { face in
-            let yaw = face.yaw?.doubleValue ?? 0  // nil → assume facing camera
-            return abs(yaw) < 0.5
-        }
+        // A snooper is a threat if their yaw is roughly facing the camera
+        let lookingAtScreen = snoopers.filter { abs(yaws[$0]) < 0.5 }
 
         if !lookingAtScreen.isEmpty {
-            if threatStartTime == nil {
-                threatStartTime = Date()
-            }
+            if threatStartTime == nil { threatStartTime = Date() }
 
             if let start = threatStartTime, Date().timeIntervalSince(start) >= detectionDelay {
                 triggerSwitch()
@@ -259,22 +342,18 @@ class ScreenGuardController: NSObject, ObservableObject {
 
     private func clearThreat() {
         threatStartTime = nil
-        if threatDetected {
-            threatDetected = false
-        }
+        if threatDetected { threatDetected = false }
     }
 
-    // MARK: - App Switching
+    // MARK: - App Switching (main thread)
 
     private func triggerSwitch() {
         guard !threatDetected else { return }   // avoid re-triggering during cooldown
 
-        // Check if the current foreground app is in the whitelist
+        // Whitelist check: if the current foreground app is safe, skip switching
         if let frontApp = NSWorkspace.shared.frontmostApplication,
            let frontBundleId = frontApp.bundleIdentifier {
-            let isWhitelisted = whitelistedApps.contains { $0.bundleId == frontBundleId }
-            if isWhitelisted {
-                // Current app is safe, don't switch
+            if whitelistedApps.contains(where: { $0.bundleId == frontBundleId }) {
                 statusMessage = "✅ 白名单应用，已跳过"
                 threatStartTime = nil
                 return
@@ -283,29 +362,44 @@ class ScreenGuardController: NSObject, ObservableObject {
 
         threatDetected = true
         statusMessage = "🚨 已切换到 \(targetApp.name)！"
-
         switchToTargetApp()
 
-        // Start cooldown
-        cooldownUntil = Date().addingTimeInterval(cooldownDuration)
+        // --- Snapshot capture ---
+        // Grab the latest pixel buffer reference (thread-safe via lock) and dispatch
+        // image rendering + file I/O to the background snapshotQueue.
+        if snapshotEnabled, let dir = snapshotDirectory {
+            bufferLock.lock()
+            let buffer = _latestPixelBuffer
+            bufferLock.unlock()
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + cooldownDuration) { [weak self] in
+            if let buffer = buffer {
+                snapshotQueue.async { [weak self] in
+                    self?.captureAndSaveSnapshot(from: buffer, to: dir)
+                }
+            }
+        }
+
+        let duration = cooldownDuration
+        cooldownUntil = Date().addingTimeInterval(duration)
+
+        // Use DispatchWorkItem so stopMonitoring() can cancel it before it fires.
+        let item = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.threatDetected = false
             self.threatStartTime = nil
             self.cooldownUntil = nil
-            if self.isMonitoring {
-                self.statusMessage = "✅ 监控中"
-            }
+            self.cooldownWorkItem = nil
+            if self.isMonitoring { self.statusMessage = "✅ 监控中" }
         }
+        cooldownWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: item)
     }
 
     private func switchToTargetApp() {
         let bundleId = targetApp.bundleId
 
-        // Try to activate an already-running instance
-        let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
-        if let app = runningApps.first {
+        // Activate an already-running instance first
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first {
             app.activate(options: [.activateAllWindows])
             return
         }
@@ -315,6 +409,40 @@ class ScreenGuardController: NSObject, ObservableObject {
             let config = NSWorkspace.OpenConfiguration()
             config.activates = true
             NSWorkspace.shared.openApplication(at: url, configuration: config)
+        }
+    }
+
+    // MARK: - Snapshot Capture (snapshotQueue)
+
+    /// Renders the given pixel buffer to a JPEG and writes it to `directory`.
+    /// Runs entirely on `snapshotQueue` to avoid blocking the camera pipeline or the UI.
+    private func captureAndSaveSnapshot(from pixelBuffer: CVPixelBuffer, to directory: URL) {
+        // 1. Convert CVPixelBuffer → CIImage → CGImage
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+
+        // 2. Convert CGImage → JPEG data
+        let nsImage = NSImage(cgImage: cgImage, size: .zero)
+        guard let tiffData  = nsImage.tiffRepresentation,
+              let bitmap    = NSBitmapImageRep(data: tiffData),
+              let jpegData  = bitmap.representation(using: .jpeg,
+                                                    properties: [.compressionFactor: 0.9])
+        else { return }
+
+        // 3. Build filename: intruder_2026-02-25_15-30-00.123.jpg
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss.SSS"
+        let timestamp = formatter.string(from: Date())
+        let fileURL = directory.appendingPathComponent("intruder_\(timestamp).jpg")
+
+        // 4. Write to disk
+        do {
+            try jpegData.write(to: fileURL, options: .atomic)
+            DispatchQueue.main.async { [weak self] in
+                self?.sessionSnapshotCount += 1
+            }
+        } catch {
+            // Silently fail — a snapshot error must never disrupt monitoring
         }
     }
 
@@ -376,12 +504,19 @@ extension ScreenGuardController: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
+        // Store the latest frame for snapshot capture.
+        // We hold a strong reference here — CVPixelBuffer is reference-counted,
+        // so keeping it prevents the buffer pool from reusing it prematurely.
+        bufferLock.lock()
+        _latestPixelBuffer = pixelBuffer
+        bufferLock.unlock()
+
         let request = VNDetectFaceRectanglesRequest { [weak self] request, _ in
             guard let results = request.results as? [VNFaceObservation] else { return }
             self?.processFaces(results)
         }
 
-        // Use latest revision for yaw support
+        // Use latest revision for yaw (roll/pitch) support
         request.revision = VNDetectFaceRectanglesRequestRevision3
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])

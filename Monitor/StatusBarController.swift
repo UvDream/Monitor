@@ -16,6 +16,17 @@ class StatusBarController: NSObject, ObservableObject {
     private var statusMenuItem: NSMenuItem!
     private var faceCountMenuItem: NSMenuItem!
 
+    // FIX: Pre-render all four icons exactly once and cache them.
+    // Previously makeIcon() was called on every state change (every 200 ms at peak),
+    // recreating an NSImage each time. Now each state maps to a single cached image.
+    private lazy var iconCache: [IconState: NSImage] = {
+        var cache: [IconState: NSImage] = [:]
+        for state in IconState.allCases {
+            cache[state] = makeIcon(state: state)
+        }
+        return cache
+    }()
+
     func setup(with controller: ScreenGuardController) {
         self.controller = controller
 
@@ -23,7 +34,7 @@ class StatusBarController: NSObject, ObservableObject {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
-            button.image = makeIcon(state: .idle)
+            button.image = iconCache[.idle]
             button.imagePosition = .imageLeading
             button.title = "0"
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
@@ -67,14 +78,12 @@ class StatusBarController: NSObject, ObservableObject {
         // Status display (disabled, just informational)
         statusMenuItem = NSMenuItem(title: "状态: 就绪", action: nil, keyEquivalent: "")
         statusMenuItem.isEnabled = false
-        let statusImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: nil)
-        statusMenuItem.image = statusImage
+        statusMenuItem.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: nil)
         menu.addItem(statusMenuItem)
 
         faceCountMenuItem = NSMenuItem(title: "检测人脸: 0", action: nil, keyEquivalent: "")
         faceCountMenuItem.isEnabled = false
-        let faceImage = NSImage(systemSymbolName: "person.2.fill", accessibilityDescription: nil)
-        faceCountMenuItem.image = faceImage
+        faceCountMenuItem.image = NSImage(systemSymbolName: "person.2.fill", accessibilityDescription: nil)
         menu.addItem(faceCountMenuItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -82,8 +91,7 @@ class StatusBarController: NSObject, ObservableObject {
         // Toggle monitoring
         toggleMenuItem = NSMenuItem(title: "▶ 开始监控", action: #selector(toggleMonitoring), keyEquivalent: "m")
         toggleMenuItem.target = self
-        let playImage = NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: nil)
-        toggleMenuItem.image = playImage
+        toggleMenuItem.image = NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: nil)
         menu.addItem(toggleMenuItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -91,8 +99,7 @@ class StatusBarController: NSObject, ObservableObject {
         // Show/hide main window
         let windowItem = NSMenuItem(title: "显示主窗口", action: #selector(showMainWindow), keyEquivalent: "w")
         windowItem.target = self
-        let windowImage = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
-        windowItem.image = windowImage
+        windowItem.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
         menu.addItem(windowItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -100,8 +107,7 @@ class StatusBarController: NSObject, ObservableObject {
         // Quit
         let quitItem = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
-        let quitImage = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
-        quitItem.image = quitImage
+        quitItem.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         menu.addItem(quitItem)
 
         statusItem.menu = menu
@@ -131,29 +137,23 @@ class StatusBarController: NSObject, ObservableObject {
 
     // MARK: - Appearance Updates
 
-    private enum IconState {
-        case idle       // gray - not monitoring
-        case calibrating // yellow - calibrating
-        case monitoring  // green - active & safe
-        case threat      // red - threat detected
+    private enum IconState: CaseIterable {
+        case idle           // gray  – not monitoring
+        case calibrating    // yellow – calibrating
+        case monitoring     // green  – active & safe
+        case threat         // red    – threat detected
     }
 
     private func updateAppearance(monitoring: Bool, threat: Bool, calibrated: Bool) {
         let state: IconState
-        if !monitoring {
-            state = .idle
-        } else if threat {
-            state = .threat
-        } else if !calibrated {
-            state = .calibrating
-        } else {
-            state = .monitoring
-        }
+        if !monitoring        { state = .idle }
+        else if threat        { state = .threat }
+        else if !calibrated   { state = .calibrating }
+        else                  { state = .monitoring }
 
-        // Update icon
-        statusItem.button?.image = makeIcon(state: state)
+        // Use cached icon — no new NSImage allocation on every frame
+        statusItem.button?.image = iconCache[state]
 
-        // Update toggle menu item
         if monitoring {
             toggleMenuItem.title = "■ 停止监控"
             toggleMenuItem.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: nil)
@@ -163,9 +163,9 @@ class StatusBarController: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Icon Rendering
+    // MARK: - Icon Rendering (called once per state at startup, then results are cached)
 
-    /// Creates a template-style menu bar icon: an eye inside a shield, with a colored dot indicator.
+    /// Creates a menu bar icon: an eye symbol with a colored state-indicator dot.
     private func makeIcon(state: IconState) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
@@ -174,23 +174,22 @@ class StatusBarController: NSObject, ObservableObject {
                 let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
                 let configured = eyeSymbol.withSymbolConfiguration(config) ?? eyeSymbol
 
-                // Center the eye symbol
                 let symbolSize = configured.size
                 let x = (rect.width - symbolSize.width) / 2
                 let y = (rect.height - symbolSize.height) / 2 + 1.5  // slight upward offset for dot space
                 configured.draw(in: NSRect(x: x, y: y, width: symbolSize.width, height: symbolSize.height))
             }
 
-            // Draw colored indicator dot at bottom-right
+            // Colored indicator dot at bottom-right
             let dotSize: CGFloat = 5
             let dotRect = NSRect(x: rect.width - dotSize - 1, y: 1, width: dotSize, height: dotSize)
 
             let dotColor: NSColor
             switch state {
-            case .idle:         dotColor = NSColor.systemGray
-            case .calibrating:  dotColor = NSColor.systemYellow
-            case .monitoring:   dotColor = NSColor.systemGreen
-            case .threat:       dotColor = NSColor.systemRed
+            case .idle:        dotColor = .systemGray
+            case .calibrating: dotColor = .systemYellow
+            case .monitoring:  dotColor = .systemGreen
+            case .threat:      dotColor = .systemRed
             }
 
             dotColor.setFill()

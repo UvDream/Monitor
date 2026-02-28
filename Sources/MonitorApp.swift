@@ -7,9 +7,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let screenGuardController = ScreenGuardController()
     var mainWindow: NSWindow!
 
+    /// Holds references to event monitors so they stay alive for the app's lifetime.
+    private var globalMonitor: Any?
+    private var localMonitor: Any?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Create the main window manually
         createMainWindow()
+
+        // Register global hotkeys (work even when another app is in the foreground)
+        registerGlobalHotkeys()
 
         // Initialize status bar
         statusBarController = StatusBarController()
@@ -43,6 +50,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func showMainWindow() {
         mainWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // MARK: - Global Hotkeys
+
+    /// Registers both a **global** monitor (fires when OTHER apps are active)
+    /// and a **local** monitor (fires when THIS app is active).
+    /// This ensures the hotkey works no matter which app is in the foreground.
+    ///
+    /// Hotkeys:
+    ///   • Cmd+Shift+M  → toggle monitoring on/off
+    ///   • Cmd+Shift+0  → show main window
+    private func registerGlobalHotkeys() {
+        let handler: (NSEvent) -> NSEvent? = { [weak self] event in
+            self?.handleHotkeyEvent(event)
+            return event // pass the event through (required for local monitor)
+        }
+
+        // Global monitor — triggers when our app is NOT the active app
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
+            _ = handler(event)
+        }
+
+        // Local monitor — triggers when our app IS the active app
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: handler)
+    }
+
+    private func handleHotkeyEvent(_ event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // Cmd+Shift+M → toggle monitoring
+        if flags == [.command, .shift] && event.charactersIgnoringModifiers?.lowercased() == "m" {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if self.screenGuardController.isMonitoring {
+                    self.screenGuardController.stopMonitoring()
+                } else {
+                    self.screenGuardController.startMonitoring()
+                }
+            }
+            return
+        }
+
+        // Cmd+Shift+0 → show main window
+        if flags == [.command, .shift] && event.charactersIgnoringModifiers == "0" {
+            DispatchQueue.main.async { [weak self] in
+                self?.showMainWindow()
+            }
+            return
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

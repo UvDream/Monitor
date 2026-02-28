@@ -88,16 +88,17 @@ class StatusBarController: NSObject, ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Toggle monitoring
-        toggleMenuItem = NSMenuItem(title: "▶ 开始监控", action: #selector(toggleMonitoring), keyEquivalent: "m")
+        // Toggle monitoring  (Cmd+Shift+M — matches the hidden main menu shortcut)
+        toggleMenuItem = NSMenuItem(title: "▶ 开始监控", action: #selector(toggleMonitoring), keyEquivalent: "M")
+        toggleMenuItem.keyEquivalentModifierMask = [.command, .shift]
         toggleMenuItem.target = self
         toggleMenuItem.image = NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: nil)
         menu.addItem(toggleMenuItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // Show/hide main window
-        let windowItem = NSMenuItem(title: "显示主窗口", action: #selector(showMainWindow), keyEquivalent: "w")
+        // Show/hide main window  (Cmd+0)
+        let windowItem = NSMenuItem(title: "显示主窗口", action: #selector(showMainWindow), keyEquivalent: "0")
         windowItem.target = self
         windowItem.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
         menu.addItem(windowItem)

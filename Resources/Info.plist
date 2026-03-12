@@ -5,13 +5,13 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>zh-Hans</string>
     <key>CFBundleExecutable</key>
-    <string>Monitor</string>
+    <string>屏幕卫士</string>
     <key>CFBundleIdentifier</key>
     <string>com.local.Monitor</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Monitor</string>
+    <string>屏幕卫士</string>
     <key>CFBundleDisplayName</key>
     <string>屏幕卫士</string>
     <key>CFBundlePackageType</key>
